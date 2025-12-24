@@ -29,6 +29,7 @@ DEFAULT_LOG_SUBDIR = "download_logs"
 DEFAULT_DATASET_SUBDIR = "tcga_dataset"
 DEFAULT_LOG_FILE = "tcga_download_log.tsv"
 COMPLETED_FILES_LOG = "completed_downloads.txt"
+FAILED_FILES_LOG = "failed_downloads.txt"
 
 
 def calculate_md5(file_path, block_size=8192):
@@ -146,6 +147,33 @@ def check_s3_object_existence(s3_client, bucket_name, s3_key):
         return False, 3, f"Unknown Error: {str(e)}"
 
 
+def parse_failed_files_from_log(log_file_path):
+    """Extract failed files from a previous run's log file."""
+    failed_files = []
+    if not os.path.exists(log_file_path):
+        print(f"Error: Log file not found: {log_file_path}", file=sys.stderr)
+        return None
+    
+    try:
+        with open(log_file_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                status = row.get("Status", "")
+                # Consider these statuses as "failed" or "needs retry"
+                if status in ["FAILED_DOWNLOAD", "FAILED_INTEGRITY", "S3_CHECK_FAILED"]:
+                    failed_files.append({
+                        "uuid": row.get("UUID"),
+                        "name": row.get("Filename"),
+                        "md5": row.get("Expected_MD5"),
+                        "size": "N/A"  # Not stored in log
+                    })
+        print(f"Info: Found {len(failed_files)} failed files in log: {log_file_path}")
+        return failed_files
+    except Exception as e:
+        print(f"Error: Failed to parse log file '{log_file_path}': {e}", file=sys.stderr)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Robust TCGA Data Downloader using GDC Manifest and AWS S3 (boto3).",
@@ -161,6 +189,8 @@ def main():
     parser.add_argument("--aws-profile", help="AWS CLI profile to use.")
     parser.add_argument("--retries", type=int, default=3, help="Max retries for S3 download.")
     parser.add_argument("--retry-delay", type=int, default=2, help="Seconds between retries.")
+    parser.add_argument("--retry-failed-log", type=str, help="Retry only failed files from a specific log file (e.g., tcga_download_log_20231224_105701.tsv).")
+    parser.add_argument("--fast-resume", action="store_true", help="Skip MD5 calculation for files in completed_downloads.txt (faster but less safe).")
 
     args = parser.parse_args()
 
@@ -178,10 +208,18 @@ def main():
         use_no_sign_request = True
         print("Info: Targeting public 'tcga-2-open' bucket without profile. Auto-enabling --no-sign-request.")
 
-    # --- Parse Manifest ---
-    all_files = parse_manifest(args.manifest)
-    if not all_files:
-        sys.exit(1)
+    # --- Parse Manifest or Retry Log ---
+    if args.retry_failed_log:
+        # Retry mode: only process failed files from specific log
+        all_files = parse_failed_files_from_log(args.retry_failed_log)
+        if not all_files:
+            sys.exit(1)
+        print(f"Info: RETRY MODE - Processing {len(all_files)} failed files from log")
+    else:
+        # Normal mode: parse manifest
+        all_files = parse_manifest(args.manifest)
+        if not all_files:
+            sys.exit(1)
 
     # --- Filter Files ---
     files_to_process = []
@@ -213,8 +251,10 @@ def main():
     log_file_name = f"tcga_download_log_{timestamp}.tsv"
     log_file_path = os.path.join(log_dir, log_file_name)
     completed_file_path = os.path.join(log_dir, COMPLETED_FILES_LOG)
+    failed_file_path = os.path.join(log_dir, FAILED_FILES_LOG)
     print(f"Info: Logs will be written to: {log_file_path}")
     print(f"Info: Completed files tracked in: {completed_file_path}")
+    print(f"Info: Failed files will be listed in: {failed_file_path}")
 
     # --- Initialize S3 Client ---
     session_opts = {}
@@ -261,9 +301,16 @@ def main():
     log_headers = ["Timestamp", "Status", "UUID", "Filename", "S3_URI", "Local_Path", "Expected_MD5", "Actual_MD5", "Message"]
     
     with open(log_file_path, "w", newline="", encoding="utf-8") as log_f, \
-         open(completed_file_path, "a", encoding="utf-8") as completed_f:
+         open(completed_file_path, "a", encoding="utf-8") as completed_f, \
+         open(failed_file_path, "w", encoding="utf-8") as failed_f:
         writer = csv.DictWriter(log_f, fieldnames=log_headers, delimiter="\t")
         writer.writeheader()
+        
+        # Write header for failed files list
+        failed_f.write("# Failed downloads from this session - use with --retry-failed-log\n")
+        failed_f.write("# Format: UUID|Filename|MD5|Status|Message\n")
+
+        failed_items = []  # Track failed items for summary
 
         def log_event(status, item, message, local_path="N/A", actual_md5="N/A"):
             row = {
@@ -286,6 +333,13 @@ def main():
             completed_f.write(completed_record)
             completed_f.flush()
 
+        def mark_failed(item, status, message):
+            """Mark file as failed in this session's failed list"""
+            failed_record = f"{item['uuid']}|{item['name']}|{item['md5']}|{status}|{message}\n"
+            failed_f.write(failed_record)
+            failed_f.flush()
+            failed_items.append(item)
+
         for i, item in enumerate(files_to_process):
             stats["processed"] += 1
             uuid = item["uuid"]
@@ -297,16 +351,30 @@ def main():
             # 0. Check if already completed in previous runs
             completed_record = f"{item['uuid']}|{item['name']}|{item['md5']}"
             if completed_record in completed_files:
-                print(f"  [SKIP] Already completed in previous run.")
-                log_event("SKIPPED_COMPLETED", item, "Already downloaded and verified in previous run")
-                stats["skipped_completed"] += 1
-                continue
+                if args.fast_resume:
+                    # Fast mode: trust the completed log without re-verifying
+                    print(f"  [SKIP] Already completed in previous run (fast-resume mode).")
+                    log_event("SKIPPED_COMPLETED", item, "Already downloaded and verified in previous run (fast-resume)")
+                    stats["skipped_completed"] += 1
+                    continue
+                else:
+                    # Safe mode: verify file still exists and has correct size (quick check)
+                    target_uuid_dir = os.path.join(data_dir, uuid)
+                    local_path = os.path.join(target_uuid_dir, filename)
+                    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                        print(f"  [SKIP] Already completed in previous run (file verified).")
+                        log_event("SKIPPED_COMPLETED", item, "Already downloaded and verified in previous run")
+                        stats["skipped_completed"] += 1
+                        continue
+                    else:
+                        print(f"  [WARN] File missing or corrupted, re-downloading...")
             
             # 1. Check S3 Existence
             exists_in_s3, code, msg = check_s3_object_existence(s3, s3_bucket_name, s3_key)
             if not exists_in_s3:
                 print(f"  [SKIP] S3 Check Failed: {msg}")
                 log_event("S3_CHECK_FAILED", item, msg)
+                mark_failed(item, "S3_CHECK_FAILED", msg)
                 stats["skipped_s3_error"] += 1
                 continue
             
@@ -362,11 +430,13 @@ def main():
                     else:
                         print(f"  [FAIL] Integrity check failed! Got {final_md5}, expected {item['md5']}")
                         log_event("FAILED_INTEGRITY", item, "MD5 mismatch after download", local_path, final_md5)
+                        mark_failed(item, "FAILED_INTEGRITY", f"MD5 mismatch: got {final_md5}")
                         stats["failed"] += 1
 
             except Exception as e:
                 print(f"  [ERROR] Download failed: {e}")
                 log_event("FAILED_DOWNLOAD", item, str(e), local_path)
+                mark_failed(item, "FAILED_DOWNLOAD", str(e))
                 stats["failed"] += 1
 
     # --- Summary ---
@@ -384,6 +454,11 @@ def main():
     print(f"Failed (Download/Verify):  {stats['failed']}")
     print("-" * 30)
     print(f"Log file: {log_file_path}")
+    if stats["failed"] > 0:
+        print(f"\n⚠️  RETRY COMMAND for failed files:")
+        print(f"python3 download_tcga_boto3.py \\")
+        print(f"  --retry-failed-log {log_file_path} \\")
+        print(f"  --output-base-dir {args.output_base_dir}")
     print("="*50)
 
 if __name__ == "__main__":

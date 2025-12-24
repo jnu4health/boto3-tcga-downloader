@@ -23,6 +23,12 @@ The primary script for batch downloading files based on a GDC Manifest.
 A helper script to download or inspect a specific file/folder by its UUID without a manifest.
 *   Useful for ad-hoc downloads or inspecting the contents of a specific UUID folder on S3.
 
+### 3. `generate_retry_manifest.py` (Retry Helper)
+Extract failed downloads from log files and generate a retry manifest.
+*   Parses download logs to identify failed files
+*   Creates a new manifest containing only failed downloads
+*   Useful for targeted retry without reprocessing successful downloads
+
 ## Prerequisites
 
 *   Python 3.x
@@ -105,6 +111,47 @@ python3 download_by_uuid.py \
   --output_dir ./tmp
 ```
 
+### 3. Retry Failed Downloads
+
+**Method 1: Direct Retry from Log File (Recommended - Fastest)**
+```bash
+# If you have 100 files with 5 failures, retry only the 5 failed ones
+python3 download_tcga_boto3.py \
+  --retry-failed-log ./downloads/download_logs/tcga_download_log_20231224_105701.tsv \
+  --output-base-dir ./downloads
+```
+
+**Method 2: Generate Retry Manifest (More Flexible)**
+```bash
+# Step 1: Generate a manifest from failed files
+python3 generate_retry_manifest.py \
+  --log-file ./downloads/download_logs/tcga_download_log_20231224_105701.tsv \
+  --output ./manifest/retry_manifest.txt
+
+# Step 2: Use the retry manifest
+python3 download_tcga_boto3.py \
+  --manifest ./manifest/retry_manifest.txt \
+  --output-base-dir ./downloads
+```
+
+**Method 3: Simple Re-run (Works but slower for large datasets)**
+```bash
+# Just re-run the original command - it will skip completed files
+# WARNING: Will recalculate MD5 for all existing files (slow for large files)
+python3 download_tcga_boto3.py \
+  --manifest ./manifest/gdc_manifest.txt \
+  --output-base-dir ./downloads
+```
+
+**Fast Resume Mode (Skip MD5 Calculation)**
+```bash
+# Trust completed_downloads.txt without re-verifying MD5 (faster but less safe)
+python3 download_tcga_boto3.py \
+  --manifest ./manifest/gdc_manifest.txt \
+  --output-base-dir ./downloads \
+  --fast-resume
+```
+
 ## Directory Structure
 
 The `download_tcga_boto3.py` script will create the following structure:
@@ -114,7 +161,8 @@ The `download_tcga_boto3.py` script will create the following structure:
 ├── download_logs/                      # Operation logs (.tsv + tracking)
 │   ├── tcga_download_log_20231224_105701.tsv   # Timestamped session log
 │   ├── tcga_download_log_20231224_110015.tsv   # Another session log
-│   └── completed_downloads.txt         # Persistent record of completed files (never lost)
+│   ├── completed_downloads.txt         # Persistent record of completed files (never lost)
+│   └── failed_downloads.txt            # Failed files from last session (overwritten each run)
 └── tcga_dataset/                       # Downloaded Data
     ├── [UUID_1]/
     │   └── filename_1.svs
@@ -136,6 +184,11 @@ The `download_tcga_boto3.py` script will create the following structure:
     *   Format: `uuid|filename|md5` (one per line)
     *   **Never gets overwritten or deleted** - it only appends
     *   Enables automatic breakpoint-continuation: if the script is interrupted and rerun, it will skip any files already recorded here
+
+*   **`failed_downloads.txt`**: Session-specific failed files list:
+    *   Format: `uuid|filename|md5|status|message` (one per line)
+    *   **Overwritten each run** with failures from current session
+    *   Used for quick reference and debugging
 
 ### Breakpoint-Continuation (断点续传) Features
 
@@ -160,4 +213,64 @@ nohup python3 download_tcga_boto3.py --manifest manifest.txt --output-base-dir /
 
 # Second run: Automatically resumes from file 81, skips the 80 already completed
 nohup python3 download_tcga_boto3.py --manifest manifest.txt --output-base-dir /data > log2.log 2>&1 &
+```
+
+## Performance Optimization
+
+### MD5 Calculation Cost Analysis
+
+**Problem**: MD5 calculation is CPU-intensive for large files (e.g., 5GB SVS files can take 30+ seconds per file)
+
+**Solutions Available**:
+
+1. **Fast Resume Mode** (`--fast-resume`):
+   - Trusts `completed_downloads.txt` without re-verifying MD5
+   - Only checks if file exists and has non-zero size
+   - ⚡ **~100x faster** for large datasets with many existing files
+   - ⚠️ **Less safe**: Won't detect corrupted files
+
+2. **Direct Log Retry** (`--retry-failed-log`):
+   - Only processes files that failed in a specific run
+   - Skips all successful files without any checks
+   - ⚡ **Instant start** - no manifest parsing or validation needed
+   - ✅ **Recommended for retry scenarios**
+
+3. **Standard Mode** (default):
+   - Full MD5 verification for all existing files
+   - Safest but slowest
+   - Good for first run or when data integrity is critical
+
+### Retry Strategy Recommendations
+
+| Scenario | Recommended Method | Command |
+|----------|-------------------|---------|
+| **Network interruption during download** | Direct log retry | `--retry-failed-log log.tsv` |
+| **First retry after failures** | Direct log retry | `--retry-failed-log log.tsv` |
+| **Multiple retries needed** | Generate retry manifest | `generate_retry_manifest.py` |
+| **Large dataset resume (trusted source)** | Fast resume | `--fast-resume` |
+| **Data integrity critical** | Standard mode | (no extra flags) |
+
+### Example Workflow
+
+```bash
+# Initial download (100 files, 5 fail due to network issues)
+python3 download_tcga_boto3.py \
+  --manifest manifest.txt \
+  --output-base-dir /data
+
+# Output shows:
+# ⚠️  RETRY COMMAND for failed files:
+# python3 download_tcga_boto3.py \
+#   --retry-failed-log /data/download_logs/tcga_download_log_20231224_105701.tsv \
+#   --output-base-dir /data
+
+# Quick retry (only processes the 5 failed files)
+python3 download_tcga_boto3.py \
+  --retry-failed-log /data/download_logs/tcga_download_log_20231224_105701.tsv \
+  --output-base-dir /data
+
+# If failures persist, generate manifest for manual inspection
+python3 generate_retry_manifest.py \
+  --log-file /data/download_logs/tcga_download_log_20231224_110230.tsv \
+  --output /data/manifest/retry_manifest.txt
 ```
