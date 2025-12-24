@@ -28,6 +28,7 @@ S3_BUCKET_OPEN = "s3://tcga-2-open"
 DEFAULT_LOG_SUBDIR = "download_logs"
 DEFAULT_DATASET_SUBDIR = "tcga_dataset"
 DEFAULT_LOG_FILE = "tcga_download_log.tsv"
+COMPLETED_FILES_LOG = "completed_downloads.txt"
 
 
 def calculate_md5(file_path, block_size=8192):
@@ -155,7 +156,7 @@ def main():
     parser.add_argument("-e", "--allowed-extensions", type=str, default=None, help="Filter by extensions (comma-separated, e.g. 'svs,bam').")
     parser.add_argument("-b", "--s3-bucket", default=S3_BUCKET_OPEN, help="S3 Bucket name.")
     parser.add_argument("--check-only", action="store_true", help="Only check file existence on S3, do not download.")
-    parser.add_argument("--skip-existing", action="store_true", help="Skip download if local file exists and MD5 matches.")
+    parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip download if local file exists and MD5 matches (default: True).")
     parser.add_argument("--no-sign-request", action="store_true", help="Use anonymous AWS access (default for tcga-2-open).")
     parser.add_argument("--aws-profile", help="AWS CLI profile to use.")
     parser.add_argument("--retries", type=int, default=3, help="Max retries for S3 download.")
@@ -207,8 +208,13 @@ def main():
     if not args.check_only:
         os.makedirs(data_dir, exist_ok=True)
 
-    log_file_path = os.path.join(log_dir, DEFAULT_LOG_FILE)
+    # Generate timestamped log file name
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_name = f"tcga_download_log_{timestamp}.tsv"
+    log_file_path = os.path.join(log_dir, log_file_name)
+    completed_file_path = os.path.join(log_dir, COMPLETED_FILES_LOG)
     print(f"Info: Logs will be written to: {log_file_path}")
+    print(f"Info: Completed files tracked in: {completed_file_path}")
 
     # --- Initialize S3 Client ---
     session_opts = {}
@@ -228,18 +234,34 @@ def main():
         print(f"Error: Failed to initialize S3 client or connect to bucket '{s3_bucket_name}': {e}", file=sys.stderr)
         sys.exit(1)
 
+    # --- Load Previously Completed Files ---
+    completed_files = set()
+    if os.path.exists(completed_file_path):
+        try:
+            with open(completed_file_path, "r", encoding="utf-8") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        # Format: uuid|filename|md5
+                        completed_files.add(line)
+            print(f"Info: Loaded {len(completed_files)} previously completed files from {completed_file_path}")
+        except Exception as e:
+            print(f"Warning: Failed to load completed files log: {e}", file=sys.stderr)
+
     # --- Processing Loop ---
     stats = {
         "processed": 0,
         "success": 0,
         "skipped_existing": 0,
         "skipped_s3_error": 0,
-        "failed": 0
+        "failed": 0,
+        "skipped_completed": 0
     }
 
     log_headers = ["Timestamp", "Status", "UUID", "Filename", "S3_URI", "Local_Path", "Expected_MD5", "Actual_MD5", "Message"]
     
-    with open(log_file_path, "w", newline="", encoding="utf-8") as log_f:
+    with open(log_file_path, "w", newline="", encoding="utf-8") as log_f, \
+         open(completed_file_path, "a", encoding="utf-8") as completed_f:
         writer = csv.DictWriter(log_f, fieldnames=log_headers, delimiter="\t")
         writer.writeheader()
 
@@ -258,6 +280,12 @@ def main():
             writer.writerow(row)
             log_f.flush()
 
+        def mark_completed(item):
+            """Mark file as completed in persistent log"""
+            completed_record = f"{item['uuid']}|{item['name']}|{item['md5']}\n"
+            completed_f.write(completed_record)
+            completed_f.flush()
+
         for i, item in enumerate(files_to_process):
             stats["processed"] += 1
             uuid = item["uuid"]
@@ -265,6 +293,14 @@ def main():
             s3_key = f"{uuid}/{filename}"
             
             print(f"\n[{i+1}/{len(files_to_process)}] Processing: {filename} ({uuid})")
+            
+            # 0. Check if already completed in previous runs
+            completed_record = f"{item['uuid']}|{item['name']}|{item['md5']}"
+            if completed_record in completed_files:
+                print(f"  [SKIP] Already completed in previous run.")
+                log_event("SKIPPED_COMPLETED", item, "Already downloaded and verified in previous run")
+                stats["skipped_completed"] += 1
+                continue
             
             # 1. Check S3 Existence
             exists_in_s3, code, msg = check_s3_object_existence(s3, s3_bucket_name, s3_key)
@@ -290,6 +326,7 @@ def main():
                 if local_md5 == item["md5"]:
                     print(f"  [SKIP] MD5 Verified. Skipping download.")
                     log_event("SKIPPED_EXISTING", item, "MD5 verified locally", local_path, local_md5)
+                    mark_completed(item)
                     stats["skipped_existing"] += 1
                     continue
                 else:
@@ -320,6 +357,7 @@ def main():
                     if final_md5 == item["md5"]:
                         print(f"  [SUCCESS] Download verified.")
                         log_event("SUCCESS", item, "Download and verification successful", local_path, final_md5)
+                        mark_completed(item)
                         stats["success"] += 1
                     else:
                         print(f"  [FAIL] Integrity check failed! Got {final_md5}, expected {item['md5']}")
@@ -340,6 +378,7 @@ def main():
     print(f"Skipped (Extension):       {skipped_extensions}")
     print("-" * 30)
     print(f"Successfully Processed:    {stats['success']}")
+    print(f"Skipped (Previously Done): {stats['skipped_completed']}")
     print(f"Skipped (Local Existing):  {stats['skipped_existing']}")
     print(f"Skipped (S3 Missing/Err):  {stats['skipped_s3_error']}")
     print(f"Failed (Download/Verify):  {stats['failed']}")
