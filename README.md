@@ -10,7 +10,12 @@ The primary script for batch downloading files based on a GDC Manifest.
 *   **Smart Downloading**:
     *   **Pre-check**: Verifies file existence on S3 before attempting download.
     *   **Validation**: Automatically verifies MD5 checksums after download.
-    *   **Resume**: Skips files that already exist locally with matching MD5 (`--skip-existing`).
+    *   **Resume/Breakpoint-Continuation**: Skips files that already exist locally with matching MD5 (enabled by default).
+        *   **Three-Layer Verification**:
+            1. Checks `completed_downloads.txt` for previously completed files (persistent across runs)
+            2. Checks if local file exists
+            3. Verifies MD5 checksum for integrity
+        *   **Persistent Logging**: Completed downloads are recorded in `completed_downloads.txt` and never lost, even if interrupted
     *   **Filtering**: Can filter downloads by file extension (e.g., only download `.svs`).
 *   **Check-Only Mode**: Can verify S3 availability without downloading files (`--check-only`).
 
@@ -57,13 +62,21 @@ python3 download_tcga_boto3.py \
   --allowed-extensions svs
 ```
 
-**Resume/Skip Existing**:
-Skip files that have already been downloaded and verified locally.
+**Resume/Skip Existing (Default Enabled)**:
+Skip files that have already been downloaded and verified locally. Enabled by default for automatic breakpoint-continuation.
+```bash
+python3 download_tcga_boto3.py \
+  --manifest ./manifest/gdc_manifest.txt \
+  --output-base-dir ./downloads
+```
+
+**Force Re-download (Disable Resume)**:
+To force re-download all files without resuming from previous runs:
 ```bash
 python3 download_tcga_boto3.py \
   --manifest ./manifest/gdc_manifest.txt \
   --output-base-dir ./downloads \
-  --skip-existing
+  --no-skip-existing
 ```
 
 **Check S3 Existence Only (No Download)**:
@@ -98,12 +111,53 @@ The `download_tcga_boto3.py` script will create the following structure:
 
 ```
 /output-base-dir/
-├── download_logs/          # Operation logs (.tsv)
-│   └── tcga_download_log.tsv
-└── tcga_dataset/           # Downloaded Data
+├── download_logs/                      # Operation logs (.tsv + tracking)
+│   ├── tcga_download_log_20231224_105701.tsv   # Timestamped session log
+│   ├── tcga_download_log_20231224_110015.tsv   # Another session log
+│   └── completed_downloads.txt         # Persistent record of completed files (never lost)
+└── tcga_dataset/                       # Downloaded Data
     ├── [UUID_1]/
     │   └── filename_1.svs
     ├── [UUID_2]/
     │   └── filename_2.bam
     └── ...
+```
+
+### Log Files Explanation
+
+*   **`tcga_download_log_TIMESTAMP.tsv`**: Session-specific log for each run, includes columns:
+    *   `Timestamp`: When the action occurred
+    *   `Status`: SUCCESS, SKIPPED_EXISTING, FAILED_INTEGRITY, etc.
+    *   `UUID`, `Filename`: File identification
+    *   `Expected_MD5`, `Actual_MD5`: Checksum verification records
+    *   `Message`: Additional details
+
+*   **`completed_downloads.txt`**: Persistent record that persists across runs:
+    *   Format: `uuid|filename|md5` (one per line)
+    *   **Never gets overwritten or deleted** - it only appends
+    *   Enables automatic breakpoint-continuation: if the script is interrupted and rerun, it will skip any files already recorded here
+
+### Breakpoint-Continuation (断点续传) Features
+
+The script now implements full breakpoint-continuation support:
+
+1. **Automatic Resume**: When you rerun the script with the same manifest and output directory, it automatically skips:
+   - Files marked as completed in `completed_downloads.txt`
+   - Files that exist locally with matching MD5
+   
+2. **No Manual Configuration Needed**: `--skip-existing` is enabled by default
+
+3. **Persistent Tracking**: The `completed_downloads.txt` file ensures tracking persists even if:
+   - The script is interrupted (Ctrl+C)
+   - The process crashes
+   - The server disconnects
+   - Multiple concurrent runs execute (each appends to the same log)
+
+**Example Scenario**:
+```bash
+# First run: Downloads 100 files, completes 80, then interrupted
+nohup python3 download_tcga_boto3.py --manifest manifest.txt --output-base-dir /data > log1.log 2>&1 &
+
+# Second run: Automatically resumes from file 81, skips the 80 already completed
+nohup python3 download_tcga_boto3.py --manifest manifest.txt --output-base-dir /data > log2.log 2>&1 &
 ```
