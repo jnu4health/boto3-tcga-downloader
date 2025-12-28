@@ -179,7 +179,7 @@ def main():
         description="Robust TCGA Data Downloader using GDC Manifest and AWS S3 (boto3).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-m", "--manifest", required=True, help="Path to GDC Manifest file (TSV).")
+    parser.add_argument("-m", "--manifest", required=False, help="Path to GDC Manifest file (TSV).")
     parser.add_argument("-o", "--output-base-dir", required=True, help="Base output directory for data and logs.")
     parser.add_argument("-e", "--allowed-extensions", type=str, default=None, help="Filter by extensions (comma-separated, e.g. 'svs,bam').")
     parser.add_argument("-b", "--s3-bucket", default=S3_BUCKET_OPEN, help="S3 Bucket name.")
@@ -217,6 +217,10 @@ def main():
         print(f"Info: RETRY MODE - Processing {len(all_files)} failed files from log")
     else:
         # Normal mode: parse manifest
+        if not args.manifest:
+            print("Error: Either --manifest or --retry-failed-log must be provided.", file=sys.stderr)
+            parser.print_help()
+            sys.exit(1)
         all_files = parse_manifest(args.manifest)
         if not all_files:
             sys.exit(1)
