@@ -1,5 +1,7 @@
 # TCGA Data Download Toolkit
 
+[中文文档](./README_zh.md)
+
 This repository contains tools for downloading and validating TCGA (The Cancer Genome Atlas) data from the AWS S3 `tcga-2-open` bucket.
 
 ## Scripts Overview
